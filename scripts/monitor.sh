@@ -11,11 +11,12 @@ source "${SCRIPT_DIR}/utils.sh"
 
 usage() {
   cat <<EOF
-Usage: $0 [--interval <seconds>] [--threshold <cpu_percent>] [--slack-webhook <url>] [--iterations <count>]
+Usage: $0 [--interval <seconds>] [--threshold <cpu_percent>] [--mem-threshold <mem_percent>] [--slack-webhook <url>] [--iterations <count>]
 
 Options:
   --interval       Sampling interval in seconds (Default: 60)
   --threshold      CPU threshold percentage to trigger alert (Default: 80)
+  --mem-threshold  Memory usage percentage to trigger alert (Default: 90)
   --slack-webhook  Slack incoming webhook URL for alert dispatch
   --iterations     Number of iterations to run, 0 for infinite (Default: 0)
   --help           Show this help message
@@ -25,6 +26,7 @@ EOF
 
 interval=60
 cpu_threshold=80
+mem_threshold=90
 webhook=""
 iterations=0
 
@@ -36,6 +38,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --threshold)
       cpu_threshold="${2:-80}"
+      shift 2
+      ;;
+    --mem-threshold)
+      mem_threshold="${2:-90}"
       shift 2
       ;;
     --slack-webhook)
@@ -57,7 +63,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 banner
-log "INFO" "Starting system resource monitor (Interval: ${interval}s, CPU Alert Threshold: ${cpu_threshold}%)"
+log "INFO" "Starting system resource monitor (Interval: ${interval}s, CPU threshold: ${cpu_threshold}%, MEM threshold: ${mem_threshold}%)"
 
 # Graceful termination handler
 cleanup_trap() {
@@ -78,18 +84,22 @@ while true; do
 
   cpu_usage=$(awk -v idle="${cpu_idle:-0}" 'BEGIN { printf "%.1f", (100 - idle) }')
   mem_info=$(free -m | awk '/Mem:/ {printf "%d/%d MB (%.1f%%)", $3, $2, ($3/$2)*100}')
+  mem_pct=$(free -m | awk '/Mem:/ {printf "%.0f", ($3/$2)*100}')
   disk_info=$(df -h / | awk 'NR==2 {printf "%s used of %s (%s)", $3, $2, $5}')
 
   status_line="CPU: ${cpu_usage}% | MEM: ${mem_info} | DISK: ${disk_info}"
 
-  is_alert=$(awk -v usage="$cpu_usage" -v limit="$cpu_threshold" 'BEGIN { if (usage >= limit) print 1; else print 0 }')
+  cpu_alert=$(awk -v usage="$cpu_usage" -v limit="$cpu_threshold" 'BEGIN { if (usage >= limit) print 1; else print 0 }')
+  mem_alert=$(awk -v usage="${mem_pct:-0}" -v limit="$mem_threshold" 'BEGIN { if (usage >= limit) print 1; else print 0 }')
 
-  if [[ "$is_alert" -eq 1 ]]; then
-    log "WARN" "ALERT: Threshold exceeded! ${status_line}"
+  if [[ "$cpu_alert" -eq 1 || "$mem_alert" -eq 1 ]]; then
+    [[ "$cpu_alert" -eq 1 ]] && alert_reason="CPU at ${cpu_usage}%"
+    [[ "$mem_alert" -eq 1 ]] && alert_reason="${alert_reason:+${alert_reason}, }MEM at ${mem_pct}%"
+    log "WARN" "ALERT (${alert_reason}): ${status_line}"
     if [[ -n "$webhook" ]]; then
       require_command "curl" && \
         curl -sS -X POST -H 'Content-type: application/json' \
-          --data "{\"text\":\"[ALERT] Host: $(hostname) - ${status_line}\"}" \
+          --data "{\"text\":\"[ALERT] Host: $(hostname) - ${alert_reason} | ${status_line}\"}" \
           "$webhook" >/dev/null 2>&1 || true
     fi
   else
